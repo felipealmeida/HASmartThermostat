@@ -137,6 +137,8 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(const.CONF_LOOKBACK, default=const.DEFAULT_LOOKBACK): vol.All(
             cv.time_period, cv.positive_timedelta),
         vol.Optional(const.CONF_DEBUG, default=False): cv.boolean,
+        vol.Optional(const.CONF_HEATER_SELF_CYCLING, default=False): cv.boolean,
+        vol.Optional(const.CONF_COOLER_SELF_CYCLING, default=False): cv.boolean,
     }
 )
 
@@ -198,6 +200,8 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         'noiseband': config.get(const.CONF_NOISEBAND),
         'lookback': config.get(const.CONF_LOOKBACK),
         const.CONF_DEBUG: config.get(const.CONF_DEBUG),
+        'heater_self_cycling': config.get(const.CONF_HEATER_SELF_CYCLING),
+        'cooler_self_cycling': config.get(const.CONF_COOLER_SELF_CYCLING),
     }
 
     smart_thermostat = SmartThermostat(**parameters)
@@ -353,6 +357,18 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         self._control_output = self._pid_output = self._output_min
         self._force_on = False
         self._force_off = False
+        # Whether the controlled device cycles its own load independently from the
+        # thermostat (e.g. an AC whose compressor cycles on its internal thermostat,
+        # or a unit reported through a power sensor). When enabled, the PWM phase is
+        # driven by the thermostat's own intent (_pwm_out_on) instead of the observed
+        # device state, so the device's self-cycling is not mistaken for a commanded
+        # state change. The observed state is still used as feedback (hvac_action and
+        # min on/off cycle guards).
+        self._heater_self_cycling = kwargs.get('heater_self_cycling', False)
+        self._cooler_self_cycling = kwargs.get('cooler_self_cycling', False)
+        # Thermostat's intended PWM phase (True = ON phase). Only used as the control
+        # phase when the active device is self-cycling; otherwise it is merely tracked.
+        self._pwm_out_on = False
         self._boost_pid_off = kwargs.get('boost_pid_off')
         self._autotune = kwargs.get('autotune').lower()
         if self._autotune.lower() not in [
@@ -720,6 +736,9 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
         await self._async_heater_turn_off(force=True)
+        # Reset the intended PWM phase on any mode change; the next control pass
+        # will re-establish it for the newly selected device.
+        self._pwm_out_on = False
         if hvac_mode == HVACMode.HEAT:
             self._min_out = self._output_clamp_low
             self._max_out = self._output_clamp_high
@@ -900,6 +919,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                              "Thermostat.", self.entity_id, self._current_temp, self._target_temp)
 
             if not self._active or self._hvac_mode == HVACMode.OFF:
+                self._pwm_out_on = False
                 if self._force_off_state and self._hvac_mode == HVACMode.OFF and \
                         self._is_device_active:
                     _LOGGER.debug("%s: %s is active while HVAC mode is %s. Turning it OFF.",
@@ -986,6 +1006,29 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             if self._cooler_entity_id is not None:
                 entities_list.extend(self._cooler_entity_id)
             return entities_list
+
+    @property
+    def _self_cycling(self):
+        """Whether the currently active device manages its own load cycling.
+
+        Mirrors heater_or_cooler_entity selection so heating and cooling can be
+        configured independently.
+        """
+        if self.hvac_mode == HVACMode.COOL and self._cooler_entity_id is not None:
+            return self._cooler_self_cycling
+        return self._heater_self_cycling
+
+    @property
+    def _pwm_phase_on(self):
+        """Selector used to decide the PWM phase (ON vs OFF).
+
+        For a self-cycling device, use the thermostat's intended phase so its own
+        load cycling is not mistaken for a commanded state change. Otherwise fall
+        back to the observed device state (legacy/upstream behavior).
+        """
+        if self._self_cycling:
+            return self._pwm_out_on
+        return self._is_device_active
 
     async def _async_heater_turn_on(self):
         """Turn heater toggleable device on."""
@@ -1154,18 +1197,20 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
         """Set Output value for heater"""
         if self._pwm:
             if abs(self._control_output) == self._difference:
-                if not self._is_device_active:
+                if not self._pwm_phase_on:
                     _LOGGER.info("%s: Output is %s. Request turning ON %s", self.entity_id,
                                  self._difference, ", ".join([entity for entity in self.heater_or_cooler_entity]))
                     self._time_changed = time.time()
+                self._pwm_out_on = True
                 await self._async_heater_turn_on()
             elif abs(self._control_output) > 0:
                 await self.pwm_switch()
             else:
-                if self._is_device_active:
+                if self._pwm_phase_on:
                     _LOGGER.info("%s: Output is 0. Request turning OFF %s", self.entity_id,
                                  ", ".join([entity for entity in self.heater_or_cooler_entity]))
                     self._time_changed = time.time()
+                self._pwm_out_on = False
                 await self._async_heater_turn_off()
         else:
             await self._async_set_valve_value(abs(self._control_output))
@@ -1185,13 +1230,14 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             # time_off is too short, increase time_on and time_off
             time_on *= self._min_off_cycle_duration.seconds / time_off
             time_off = self._min_off_cycle_duration.seconds
-        if self._is_device_active:
+        if self._pwm_phase_on:
             if time_on <= time_passed or self._force_off:
                 _LOGGER.info(
                     "%s: ON time passed. Request turning OFF %s",
                     self.entity_id,
                     ", ".join([entity for entity in self.heater_or_cooler_entity])
                 )
+                self._pwm_out_on = False
                 await self._async_heater_turn_off()
                 self._time_changed = time.time()
             else:
@@ -1209,6 +1255,7 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                     "%s: OFF time passed. Request turning ON %s", self.entity_id,
                     ", ".join([entity for entity in self.heater_or_cooler_entity])
                 )
+                self._pwm_out_on = True
                 await self._async_heater_turn_on()
                 self._time_changed = time.time()
             else:
