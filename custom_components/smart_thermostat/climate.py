@@ -866,9 +866,21 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     @callback
     def _async_switch_changed(self, event: Event[EventStateChangedData]):
         """Handle heater switch state changes."""
+        old_state = event.data["old_state"]
         new_state = event.data["new_state"]
         if new_state is None:
             return
+        entity_id = event.data["entity_id"]
+        if (
+                old_state is not None
+                and old_state.state != new_state.state
+                and old_state.state in (STATE_ON, STATE_OFF)
+                and new_state.state in (STATE_ON, STATE_OFF)
+                and entity_id in self.heater_or_cooler_entity):
+            self._time_changed = time.time()
+            self._last_heat_cycle_time = self._time_changed
+            _LOGGER.info("%s: %s changed from %s to %s. Reset cycle timers.",
+                         self.entity_id, entity_id, old_state.state, new_state.state)
         self.async_write_ha_state()
 
     @callback
