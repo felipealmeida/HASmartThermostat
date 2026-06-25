@@ -68,3 +68,5 @@ CONF_AUTOTUNE = "autotune"
 CONF_NOISEBAND = "noiseband"
 CONF_LOOKBACK = "lookback"
 CONF_DEBUG = 'debug'
+CONF_HEATER_FEEDBACK = 'heater_feedback'
+CONF_COOLER_FEEDBACK = 'cooler_feedback'
